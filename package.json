@@ -1,0 +1,38 @@
+{
+  "name": "superagent-vs-subagents",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A hands-on comparison of the super agent pattern and Claude Code subagents, using a small Recipe Box API.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "dev": "tsx src/server.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "superagent": "tsx scripts/run-superagent.ts",
+    "subagents": "tsx scripts/run-subagents.ts",
+    "watchdog": "tsx scripts/watchdog.ts",
+    "metrics": "tsx scripts/metrics.ts",
+    "reset": "tsx scripts/reset-run.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chandrakanthbalaraman/superagent-vs-subagents"
+  },
+  "license": "MIT",
+  "author": "Chandrakanth Balaraman",
+  "dependencies": {
+    "express": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}
