@@ -1,9 +1,12 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { agentBinary } from "./agent-cli.js";
+import { buildAgentCommand } from "./agent-command.js";
+import { readAgentStream, type AgentStreamMeta } from "./agent-stream.js";
 import { parseFlags, flagString } from "./args.js";
 import { parseBoard, type Ticket } from "./board.js";
-import { buildClaudeArgs } from "./claude-command.js";
+import { readRoleMarkdown } from "./codex-prompt.js";
 import { readLaunchOptions, type LaunchOptions } from "./launch-options.js";
 import { runPool } from "./pool.js";
 import { buildRetryPrompt, buildWorkerPrompt } from "./prompt.js";
@@ -11,11 +14,10 @@ import { renderSuperagentDryRun, type RunOnly } from "./render-superagent.js";
 import { parseWorkerReport } from "./report.js";
 import { buildCheckerPrompt, buildMergerPrompt } from "./role-prompts.js";
 import { planWaves } from "./scheduler.js";
-import { runCommand } from "./spawn.js";
-import { countDelegations, readResultMeta } from "./delegations.js";
+import { runCommand, type CommandResult } from "./spawn.js";
 import { blankTicket, type RunTimings, type TicketRunRecord } from "./timings.js";
 import { scanRunDirectory } from "./watchdog.js";
-import { commandExists, MISSING_CLAUDE } from "./which.js";
+import { commandExists, MISSING_CLAUDE, MISSING_CODEX } from "./which.js";
 
 const ALLOWED = new Set([
   "--help",
@@ -30,15 +32,19 @@ const ALLOWED = new Set([
   "--permission-prompts",
   "--forward-subagent-text",
   "--bare",
+  "--agent-cli",
+  "--timeout-seconds",
 ]);
 
 export function superagentHelp(): string {
   return [
-    "Dispatch ready Recipe Box tickets to headless Claude Code workers.",
+    "Dispatch ready Recipe Box tickets to headless workers.",
     "",
     "Usage: tsx scripts/run-superagent.ts [flags]",
     "",
-    "  --dry-run                  Print the git and claude commands. Start nothing.",
+    "  --agent-cli claude|codex   Which CLI to run. Default claude. Env: SUPERAGENT_AGENT_CLI.",
+    "  --timeout-seconds <n>      Codex only. Kill the process after n seconds. Default 1800. 0 disables.",
+    "  --dry-run                  Print the git and agent commands. Start nothing.",
     "  --ticket <id>              Limit workers to one ticket id from specs/board.md.",
     "  --only all|workers|merger|checker",
     "                             Default all. checker alone reviews the current checkout.",
@@ -54,11 +60,13 @@ export function superagentHelp(): string {
     "",
     "The same values can be set with SUPERAGENT_PERMISSION_MODE, SUPERAGENT_ALLOWED_TOOLS,",
     "SUPERAGENT_MAX_TURNS, SUPERAGENT_MAX_BUDGET_USD, SUPERAGENT_MAX_PARALLEL,",
-    "SUPERAGENT_PERMISSION_PROMPTS, and SUPERAGENT_FORWARD_SUBAGENT_TEXT=1.",
+    "SUPERAGENT_PERMISSION_PROMPTS, SUPERAGENT_FORWARD_SUBAGENT_TEXT=1,",
+    "SUPERAGENT_AGENT_CLI, and SUPERAGENT_TIMEOUT_SECONDS.",
     "",
-    "Flags are the Claude Code flags documented at",
-    "https://code.claude.com/docs/en/cli-reference",
+    "Claude Code flags: https://code.claude.com/docs/en/cli-reference",
     "and https://code.claude.com/docs/en/headless",
+    "Codex flags: https://developers.openai.com/codex/noninteractive",
+    "Codex is selected with --agent-cli codex. Claude Code stays the default.",
   ].join("\n");
 }
 
@@ -83,8 +91,8 @@ export async function executeSuperagent(argv: string[], repoRoot = process.cwd()
     return 0;
   }
 
-  if (!(await commandExists("claude"))) {
-    process.stderr.write(MISSING_CLAUDE);
+  if (!(await commandExists(agentBinary(launch.agentCli)))) {
+    process.stderr.write(launch.agentCli === "codex" ? MISSING_CODEX : MISSING_CLAUDE);
     return 1;
   }
   if (!existsSync(path.join(repoRoot, "node_modules"))) {
@@ -96,6 +104,8 @@ export async function executeSuperagent(argv: string[], repoRoot = process.cwd()
   await mkdir(runDir, { recursive: true });
   const startedMs = Date.now();
   const records: TicketRunRecord[] = [];
+  const notes: string[] = [];
+  let workerFailed = false;
   const succeeded = new Set(tickets.filter((ticket) => ticket.status === "done").map((ticket) => ticket.id));
   const stopWatchdog = startWatchdog(runDir);
 
@@ -109,10 +119,13 @@ export async function executeSuperagent(argv: string[], repoRoot = process.cwd()
           return ticket.waitsFor.every((id) => succeeded.has(id));
         });
         await runPool(runnable, launch.maxParallel, async (ticket) => {
-          const record = await runWorker({ repoRoot, runDir, ticket, launch });
-          records.push(record);
-          if (record.claudeExitCode === 0 && record.npmTestExitCode === 0) {
+          const outcome = await runWorker({ repoRoot, runDir, ticket, launch });
+          records.push(outcome.record);
+          notes.push(...outcome.notes);
+          if (outcome.succeeded) {
             succeeded.add(ticket.id);
+          } else {
+            workerFailed = true;
           }
         });
       }
@@ -125,7 +138,6 @@ export async function executeSuperagent(argv: string[], repoRoot = process.cwd()
       }
     }
 
-    const notes: string[] = [];
     if (only === "all" || only === "merger") {
       notes.push(await runMerger({ repoRoot, runDir, stamp, tickets, launch }));
     }
@@ -150,7 +162,7 @@ export async function executeSuperagent(argv: string[], repoRoot = process.cwd()
     await writeFile(timingsPath, `${JSON.stringify(timings, null, 2)}\n`);
     process.stdout.write(`Timings written to ${timingsPath}\n`);
     process.stdout.write("human interventions: not measured\nplanted bug found: not measured\n");
-    return records.some((record) => record.claudeExitCode !== 0 || record.npmTestExitCode !== 0) ? 1 : 0;
+    return workerFailed ? 1 : 0;
   } finally {
     stopWatchdog();
   }
@@ -195,7 +207,7 @@ async function runWorker(input: {
   runDir: string;
   ticket: Ticket;
   launch: LaunchOptions;
-}): Promise<TicketRunRecord> {
+}): Promise<{ record: TicketRunRecord; notes: string[]; succeeded: boolean }> {
   const started = Date.now();
   const ticketDir = path.join(input.runDir, input.ticket.id);
   await mkdir(ticketDir, { recursive: true });
@@ -208,7 +220,6 @@ async function runWorker(input: {
     reportPath: path.join(ticketDir, "report.md"),
     heartbeatPath: path.join(ticketDir, "heartbeat.json"),
   });
-  await writeFile(path.join(ticketDir, "prompt.md"), prompt);
   const worktree = await ensureWorktree(input.repoRoot, `.worktrees/${input.ticket.id}`, `ticket/${input.ticket.id}`);
   await writeFile(
     path.join(ticketDir, "status.json"),
@@ -225,7 +236,8 @@ async function runWorker(input: {
   );
   await writeHeartbeat(ticketDir, "worker process started");
 
-  const first = await runClaude({
+  const first = await runAgent({
+    repoRoot: input.repoRoot,
     prompt,
     launch: input.launch,
     name: `worker-${input.ticket.id}`,
@@ -233,12 +245,14 @@ async function runWorker(input: {
     cwd: worktree,
     logPath: path.join(ticketDir, "worker.log"),
     additionalDirs: [ticketDir],
+    promptLogPath: path.join(ticketDir, "prompt.md"),
   });
   let combinedStdout = first.stdout;
-  let exitCode = first.code;
-  if (first.code !== 0 && first.meta.sessionId !== null) {
+  let last = first;
+  if (agentNeedsRetry(first) && first.meta.sessionId !== null) {
     process.stderr.write(`Retrying ${input.ticket.id} in the same session.\n`);
-    const retry = await runClaude({
+    const retry = await runAgent({
+      repoRoot: input.repoRoot,
       prompt: buildRetryPrompt(input.ticket.id),
       launch: input.launch,
       name: `worker-${input.ticket.id}`,
@@ -249,7 +263,7 @@ async function runWorker(input: {
       additionalDirs: [ticketDir],
     });
     combinedStdout = `${first.stdout}\n${retry.stdout}`;
-    exitCode = retry.code;
+    last = retry;
   }
 
   const npm = await runCommand({
@@ -259,22 +273,30 @@ async function runWorker(input: {
     logPath: path.join(ticketDir, "npm-test.log"),
   });
   const report = await readReport(path.join(ticketDir, "report.md"));
-  const meta = readResultMeta(combinedStdout);
+  const combinedMeta = readAgentStream(input.launch.agentCli, combinedStdout);
+  const runNotes = agentRunNotes(input.ticket.id, input.launch, last);
   await writeFile(
     path.join(ticketDir, "status.json"),
     `${JSON.stringify({ ticketId: input.ticket.id, state: "finished", worktree }, null, 2)}\n`,
   );
 
   const record = blankTicket(input.ticket.id, Date.now() - started);
-  record.claudeExitCode = exitCode;
+  record.claudeExitCode = last.code;
   record.npmTestExitCode = npm.code;
   record.testsPassing = npm.code === 0;
-  record.delegations = countDelegations(combinedStdout);
+  record.delegations = combinedMeta.delegations;
   record.evalFirstTry = report.evalFirstTry;
-  record.sessionId = meta.sessionId ?? first.meta.sessionId;
-  record.totalCostUsd = meta.totalCostUsd;
-  record.usage = meta.usage;
-  return record;
+  if (input.launch.agentCli === "claude") {
+    record.sessionId = combinedMeta.sessionId ?? first.meta.sessionId;
+    record.totalCostUsd = combinedMeta.totalCostUsd;
+    record.usage = combinedMeta.usage;
+  } else {
+    record.sessionId = last.meta.sessionId ?? first.meta.sessionId;
+    record.totalCostUsd = null;
+    record.usage = last.meta.usage;
+  }
+  const succeeded = last.code === 0 && !last.timedOut && !last.meta.failed && npm.code === 0;
+  return { record, notes: runNotes, succeeded };
 }
 
 async function runMerger(input: {
@@ -292,7 +314,8 @@ async function runMerger(input: {
     `integrate/${input.stamp}`,
   );
   const prompt = buildMergerPrompt({ tickets: input.tickets, reportPath: path.join(dir, "report.md") });
-  const result = await runClaude({
+  const result = await runAgent({
+    repoRoot: input.repoRoot,
     prompt,
     launch: input.launch,
     name: "merger",
@@ -301,7 +324,7 @@ async function runMerger(input: {
     logPath: path.join(dir, "merger.log"),
     additionalDirs: [dir],
   });
-  return `merger claude exit ${result.code}`;
+  return formatAgentExit("merger", input.launch, result);
 }
 
 async function runChecker(input: {
@@ -316,7 +339,8 @@ async function runChecker(input: {
     return `checker skipped because ${input.cwd} does not exist`;
   }
   const prompt = buildCheckerPrompt({ findingsPath: path.join(dir, "findings.md") });
-  const result = await runClaude({
+  const result = await runAgent({
+    repoRoot: input.repoRoot,
     prompt,
     launch: input.launch,
     name: "checker",
@@ -325,10 +349,13 @@ async function runChecker(input: {
     logPath: path.join(dir, "checker.log"),
     additionalDirs: [dir],
   });
-  return `checker claude exit ${result.code}`;
+  return formatAgentExit("checker", input.launch, result);
 }
 
-async function runClaude(input: {
+type AgentRun = CommandResult & { meta: AgentStreamMeta };
+
+async function runAgent(input: {
+  repoRoot: string;
   prompt: string;
   launch: LaunchOptions;
   name: string;
@@ -337,24 +364,56 @@ async function runClaude(input: {
   logPath: string;
   resumeSessionId?: string;
   additionalDirs?: string[];
-}): Promise<{ code: number; stdout: string; meta: ReturnType<typeof readResultMeta> }> {
-  const args = buildClaudeArgs({
+  promptLogPath?: string;
+}): Promise<AgentRun> {
+  const command = buildAgentCommand({
+    launch: input.launch,
     prompt: input.prompt,
-    permissionMode: input.launch.permissionMode,
-    maxTurns: input.launch.maxTurns,
     name: input.name,
     agent: input.agent,
-    allowedTools: input.launch.allowedTools,
-    maxBudgetUsd: input.launch.maxBudgetUsd,
-    forwardSubagentText: input.launch.forwardSubagentText,
-    permissionPrompts: input.launch.permissionPrompts,
-    bare: input.launch.bare,
+    roleMarkdown: input.launch.agentCli === "codex" ? readRoleMarkdown(input.repoRoot, input.agent) : undefined,
     resumeSessionId: input.resumeSessionId,
     additionalDirs: input.additionalDirs,
   });
-  process.stderr.write(`claude --name ${input.name} in ${input.cwd}\n`);
-  const result = await runCommand({ command: "claude", args, cwd: input.cwd, logPath: input.logPath });
-  return { code: result.code, stdout: result.stdout, meta: readResultMeta(result.stdout) };
+  if (input.promptLogPath !== undefined) {
+    await writeFile(input.promptLogPath, command.prompt);
+  }
+  if (command.command === "claude") {
+    process.stderr.write(`claude --name ${input.name} in ${input.cwd}\n`);
+  } else {
+    process.stderr.write(`codex exec in ${input.cwd}\n`);
+  }
+  const result = await runCommand({
+    command: command.command,
+    args: command.args,
+    cwd: input.cwd,
+    logPath: input.logPath,
+    timeoutMs: command.timeoutMs ?? undefined,
+  });
+  return { ...result, meta: readAgentStream(input.launch.agentCli, result.stdout) };
+}
+
+function agentNeedsRetry(run: AgentRun): boolean {
+  return run.code !== 0 || run.timedOut || run.meta.failed;
+}
+
+function agentRunNotes(ticketId: string, launch: LaunchOptions, run: AgentRun): string[] {
+  const notes: string[] = [];
+  if (run.timedOut) {
+    const seconds = launch.codexTimeoutSeconds === null ? "disabled" : String(launch.codexTimeoutSeconds);
+    notes.push(`${ticketId} hit the Codex wall-clock timeout (${seconds}s). Codex has no --max-turns.`);
+  }
+  if (run.meta.failureMessage !== null) {
+    notes.push(`${ticketId}: ${run.meta.failureMessage}`);
+  }
+  return notes;
+}
+
+function formatAgentExit(role: string, launch: LaunchOptions, run: AgentRun): string {
+  const cli = launch.agentCli === "codex" ? "codex" : "claude";
+  const exit = run.code === null ? "none" : String(run.code);
+  const timeout = run.timedOut ? " after wall-clock timeout" : "";
+  return `${role} ${cli} exit ${exit}${timeout}`;
 }
 
 async function ensureWorktree(repoRoot: string, relativePath: string, branch: string): Promise<string> {

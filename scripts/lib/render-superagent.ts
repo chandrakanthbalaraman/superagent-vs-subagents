@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { Ticket } from "./board.js";
-import { buildClaudeArgs, type ClaudeLaunch } from "./claude-command.js";
+import { buildAgentCommand, codexDryRunNotes, type AgentCommand } from "./agent-command.js";
+import { readRoleMarkdown } from "./codex-prompt.js";
 import type { LaunchOptions } from "./launch-options.js";
 import { buildRetryPrompt, buildWorkerPrompt } from "./prompt.js";
 import { buildCheckerPrompt, buildMergerPrompt } from "./role-prompts.js";
@@ -19,10 +20,15 @@ export function renderSuperagentDryRun(input: {
   stamp: string;
 }): string {
   const lines: string[] = [
-    "Dry run. No worktrees, no Claude Code process, no timings.",
+    input.launch.agentCli === "codex"
+      ? "Dry run. No worktrees, no Codex process, no timings."
+      : "Dry run. No worktrees, no Claude Code process, no timings.",
     "",
-    `Ready tickets: ${input.tickets.filter((ticket) => ticket.status === "ready").length}.`,
   ];
+  if (input.launch.agentCli === "codex") {
+    lines.push(...codexDryRunNotes(input.launch.codexTimeoutSeconds), "");
+  }
+  lines.push(`Ready tickets: ${input.tickets.filter((ticket) => ticket.status === "ready").length}.`);
 
   if (input.only === "all" || input.only === "workers") {
     lines.push(...renderWaves(input.plan));
@@ -76,13 +82,14 @@ export function renderSuperagentDryRun(input: {
       "",
       "Merger, after the workers, in a new integrate worktree:",
       `git worktree add -b integrate/${input.stamp} ${path.join(".worktrees", `integrate-${input.stamp}`)} HEAD`,
-      renderClaude(
-        "merger",
-        buildMergerPrompt({ tickets: input.tickets, reportPath }),
-        input.launch,
-        "merger",
-        reportDir,
-      ),
+      renderAgent({
+        repoRoot: input.repoRoot,
+        launch: input.launch,
+        prompt: buildMergerPrompt({ tickets: input.tickets, reportPath }),
+        name: "merger",
+        agent: "merger",
+        additionalDirs: [reportDir],
+      }),
     );
   }
 
@@ -93,7 +100,14 @@ export function renderSuperagentDryRun(input: {
       "",
       "Checker, after the merger. With --only checker it runs in the current checkout instead.",
       "The runner creates the report directory before launch so --add-dir exists.",
-      renderClaude("checker", buildCheckerPrompt({ findingsPath }), input.launch, "checker", reportDir),
+      renderAgent({
+        repoRoot: input.repoRoot,
+        launch: input.launch,
+        prompt: buildCheckerPrompt({ findingsPath }),
+        name: "checker",
+        agent: "checker",
+        additionalDirs: [reportDir],
+      }),
     );
   }
 
@@ -128,46 +142,74 @@ function renderWorker(input: {
   const worktree = path.join(".worktrees", input.ticket.id);
   const ticketDir = path.join(input.repoRoot, "runs", input.stamp, input.ticket.id);
   const prompt = workerPrompt(input.repoRoot, input.ticket, input.stamp);
-  const launch: ClaudeLaunch = {
-    ...baseLaunch(input.launch, prompt, `worker-${input.ticket.id}`),
+  const launch = agentCommand({
+    repoRoot: input.repoRoot,
+    launch: input.launch,
+    prompt,
+    name: `worker-${input.ticket.id}`,
     agent: "worker",
     additionalDirs: [ticketDir],
-  };
-  const retry: ClaudeLaunch = {
-    ...baseLaunch(input.launch, buildRetryPrompt(input.ticket.id), `worker-${input.ticket.id}`),
+  });
+  const retry = agentCommand({
+    repoRoot: input.repoRoot,
+    launch: input.launch,
+    prompt: buildRetryPrompt(input.ticket.id),
+    name: `worker-${input.ticket.id}`,
     agent: "worker",
     resumeSessionId: "<session_id>",
     additionalDirs: [ticketDir],
-  };
+  });
+  const retryLine =
+    input.launch.agentCli === "codex"
+      ? "If codex exits non-zero, reports turn.failed or error, or hits the wall-clock timeout, and thread.started included thread_id, one retry in the same worktree:"
+      : "If claude exits non-zero and the result event includes session_id, one retry in the same worktree:";
   return [
     `Worker ${input.ticket.id} (${input.ticket.mode}) in wave ${input.waveNumber}`,
     `git worktree add -b ticket/${input.ticket.id} ${worktree} HEAD`,
     `ln -s ${path.join(input.repoRoot, "node_modules")} ${path.join(worktree, "node_modules")}`,
     `cwd: ${worktree}`,
-    formatArgv("claude", buildClaudeArgs(launch)),
+    formatArgv(launch.command, launch.args),
     "prompt:",
-    prompt,
-    "If claude exits non-zero and the result event includes session_id, one retry in the same worktree:",
-    formatArgv("claude", buildClaudeArgs(retry)),
+    launch.prompt,
+    retryLine,
+    formatArgv(retry.command, retry.args),
     "npm test",
   ];
 }
 
-function renderClaude(
-  agent: string,
-  prompt: string,
-  launch: LaunchOptions,
-  name: string,
-  reportDir: string,
-): string {
-  return formatArgv(
-    "claude",
-    buildClaudeArgs({
-      ...baseLaunch(launch, prompt, name),
-      agent,
-      additionalDirs: [reportDir],
-    }),
-  );
+function renderAgent(input: {
+  repoRoot: string;
+  launch: LaunchOptions;
+  prompt: string;
+  name: string;
+  agent: string;
+  additionalDirs: string[];
+}): string {
+  const command = agentCommand(input);
+  return formatArgv(command.command, command.args);
+}
+
+function agentCommand(input: {
+  repoRoot: string;
+  launch: LaunchOptions;
+  prompt: string;
+  name: string;
+  agent?: string;
+  resumeSessionId?: string;
+  additionalDirs?: string[];
+}): AgentCommand {
+  return buildAgentCommand({
+    launch: input.launch,
+    prompt: input.prompt,
+    name: input.name,
+    agent: input.agent,
+    roleMarkdown:
+      input.launch.agentCli === "codex" && input.agent !== undefined
+        ? readRoleMarkdown(input.repoRoot, input.agent)
+        : undefined,
+    resumeSessionId: input.resumeSessionId,
+    additionalDirs: input.additionalDirs,
+  });
 }
 
 function workerPrompt(repoRoot: string, ticket: Ticket, stamp: string): string {
@@ -181,20 +223,6 @@ function workerPrompt(repoRoot: string, ticket: Ticket, stamp: string): string {
     reportPath: path.join(ticketDir, "report.md"),
     heartbeatPath: path.join(ticketDir, "heartbeat.json"),
   });
-}
-
-function baseLaunch(launch: LaunchOptions, prompt: string, name: string): ClaudeLaunch {
-  return {
-    prompt,
-    permissionMode: launch.permissionMode,
-    maxTurns: launch.maxTurns,
-    name,
-    maxBudgetUsd: launch.maxBudgetUsd,
-    allowedTools: launch.allowedTools,
-    forwardSubagentText: launch.forwardSubagentText,
-    permissionPrompts: launch.permissionPrompts,
-    bare: launch.bare,
-  };
 }
 
 function knowsTicket(tickets: Ticket[], ticketId: string): boolean {

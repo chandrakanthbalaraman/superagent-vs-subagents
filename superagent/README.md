@@ -12,7 +12,7 @@ This folder is the map. The agent definitions Claude Code loads are in `.claude/
 | `merger.md` | Merges `ticket/*` branches and runs `npm test`. |
 | `checker.md` | Calls the API and writes findings. |
 
-The mechanical runner is `scripts/run-superagent.ts` (`npm run superagent`). It is the part that creates worktrees and starts `claude -p`. The router is optional conversation on top of that script.
+The mechanical runner is `scripts/run-superagent.ts` (`npm run superagent`). It is the part that creates worktrees and starts `claude -p`. Pass `--agent-cli codex` to start `codex exec` instead. The router is optional conversation on top of that script. See the root README section "Running with Codex".
 
 Workers are not started with Claude Code's `--worktree` / `-w` flag, and the worker agent does not set `isolation: worktree`. Those are real Claude Code features. This lab uses `git worktree add` so the branch is `ticket/<id>`, the path is `.worktrees/<id>`, and the watchdog can see the last commit.
 
