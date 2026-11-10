@@ -70,6 +70,7 @@ flowchart TD
 - git
 - For a real comparison, the Claude Code CLI (`claude --version`), and either a login (`claude auth login`, then `claude auth status`) or `ANTHROPIC_API_KEY` in the environment. Do not commit the key.
 - A throwaway clone. The runners pre-approve `Bash` so an unattended session can run `npm test`. That is enough power to damage a checkout you care about.
+- Claude Code is the default agent CLI. A Codex (ChatGPT) subscription can run the same two setups. See [Running with Codex](#running-with-codex).
 
 `npm test` and `--dry-run` do not need an API key.
 
@@ -109,7 +110,8 @@ The sample stores recipes in memory. Restarting the process clears them. There i
 | `specs/tickets/` | Five ready tickets. Each has `spec.md` and `eval.md`. |
 | `superagent/` | What the expediter setup is. |
 | `.claude/agents/` | Router, worker, watchdog, merger, checker, and the team subagents. |
-| `scripts/run-superagent.ts` | Worktrees, parallel `claude -p` workers, logs, timings. |
+| `.codex/agents/` | Codex team subagents: planner, implementer, test-writer, reviewer. Used only with `--agent-cli codex`. |
+| `scripts/run-superagent.ts` | Worktrees, parallel workers, logs, timings. Claude Code by default. Codex with `--agent-cli codex`. |
 | `scripts/watchdog.ts` | Flags silent, stuck, or looping workers. |
 | `subagents/` | Plain session and team session. |
 | `scripts/run-subagents.ts` | One headless session, then a delegation count. |
@@ -147,6 +149,76 @@ Optional, off unless you set them: `--max-budget-usd`, `--permission-prompts non
 The runners do not pass `--bare` by default. Bare mode skips project agents and skills, and it does not use a subscription login. Setup A has to load the worker agent. Pass `--bare` on setup B1 only when you want a session that does not auto-load `.claude/agents/`.
 
 `--worktree` / `-w` is a real Claude Code flag. This lab does not use it. The script runs `git worktree add` so the branch name and the path stay obvious to the watchdog.
+
+## Running with Codex
+
+Claude Code stays the default. Codex is a second backend for the same two npm scripts. Checked on 2026-11-10 against the [noninteractive docs](https://developers.openai.com/codex/noninteractive), the [subagents docs](https://developers.openai.com/codex/subagents), and `codex exec --help` from `@openai/codex` 0.167.0.
+
+Prerequisites:
+
+```bash
+codex --version
+codex login
+```
+
+`codex login` stores a ChatGPT subscription login. `CODEX_API_KEY` also works for the one process that needs it. Do not commit either credential. `--dry-run` does not need a login and does not start Codex.
+
+```bash
+npm run superagent -- --agent-cli codex --dry-run
+npm run subagents -- --agent-cli codex --dry-run --mode plain
+npm run subagents -- --agent-cli codex --dry-run --mode team
+```
+
+The same switch is `SUPERAGENT_AGENT_CLI=codex`. A flag on the command wins over the environment variable.
+
+Real runs, in a throwaway clone:
+
+```bash
+npm run superagent -- --agent-cli codex
+npm run subagents -- --agent-cli codex --mode plain
+npm run subagents -- --agent-cli codex --mode team
+```
+
+`--timeout-seconds` is the wall-clock kill for each Codex process (default 1800, `0` disables it). It does not apply to Claude Code. `SUPERAGENT_TIMEOUT_SECONDS` sets the same value.
+
+### Flag mapping
+
+| Claude Code flag the runners pass | What Codex gets |
+| --- | --- |
+| `-p <prompt>` | `codex exec <prompt>`. The prompt is the last argument. |
+| `--output-format stream-json` and `--verbose` | `--json` (JSONL on stdout) and `--color never`. |
+| `--permission-mode acceptEdits` plus `--allowedTools Read,Edit,Write,Bash` | `--approve-for-me`. That flag selects the workspace-write sandbox and routes approvals through automatic review. The CLI rejects `--approve-for-me` together with `--sandbox`, so the runner does not also pass `--sandbox workspace-write`. `--full-auto` is not a current flag and is not passed. |
+| `--permission-mode bypassPermissions` | `--dangerously-bypass-approvals-and-sandbox`. No sandbox. Throwaway clone only. |
+| `--max-turns` | Nothing. Codex has no turn cap. The runner kills the process after `--timeout-seconds` of wall clock. |
+| `--agent <name>` | Nothing. Setup A inlines `.claude/agents/<name>.md` into the prompt. Setup B team uses the TOML files in `.codex/agents/` and a prompt that tells Codex to spawn those agents by name. |
+| `--name` | Nothing. The session id is `thread_id` on the `thread.started` event. |
+| `--add-dir <runs/...>` | `--add-dir <runs/...>`. `codex exec --help` calls this an extra writable directory. The noninteractive overview page does not mention it. Parent flags have to come before `resume`; `codex exec resume --add-dir` is rejected. |
+| `--resume <session_id>` | `codex exec ... resume <session_id> <prompt>`. The runner does not pass `--ephemeral`, because a resumed thread needs its saved rollout. |
+| `--append-system-prompt-file` (setup B2) | The file is inlined into the prompt. Codex has no such flag. |
+| `--max-budget-usd`, `--permission-prompts`, `--forward-subagent-text`, `--bare` | Not passed. `--bare` does not exist, so a Codex plain run still sees `.codex/agents/`. |
+
+Other Claude permission modes (`default`, `plan`, `auto`, `dontAsk`, `manual`) are rejected on the Codex backend instead of being translated into a flag the CLI does not have.
+
+### What the metrics record
+
+The scripts still do not invent numbers.
+
+- `thread.started.thread_id` becomes `sessionId`.
+- The last `turn.completed.usage` object is stored as `usage`. Numeric fields are copied. Missing fields are left out. Turns are not added together. A retry keeps the last process's usage, not the sum of the failed attempt and the retry.
+- `totalCostUsd` stays null. The JSONL usage object has token counts and no dollar cost.
+- `delegations` is the number of distinct `item.*` events whose item `type` is `collab_tool_call` and whose `tool` is `spawn_agent`. The same item id is counted once across started, updated, and completed. `send_input`, `wait`, and `close_agent` are not delegations. A Codex session that produced events and no `spawn_agent` item records 0, which means the item was absent, not that someone proved the model never tried to delegate. If the log has no recognized Codex events, the count stays null (`not measured`). The noninteractive sample does not show this item. The CLI schema does (`exec_events.rs`, `collab_tool_call` / `spawn_agent`). A build that omits the item will record 0 after `thread.started`. Say that in the run log if your `codex exec --json` output has no `collab_tool_call` lines.
+- `turn.failed` and a top-level `error` event mark the process failed. An `item` whose type is `error` does not, because the schema describes that item as non-fatal. The process exit code is still recorded. A wall-clock kill leaves the exit code null and adds a note. The field name in `timings.json` is still `claudeExitCode` for both backends.
+
+### Differences that change the experiment
+
+- Codex spawns a subagent only when the prompt, `AGENTS.md`, or a skill asks. The team prompt asks it to spawn planner, implementer, test-writer, and reviewer. The plain prompt allows a spawn and does not require one.
+- Custom agents cannot set their own sandbox or approval mode. They inherit the parent. `planner` sets `features.shell_tool = false`. The reviewer is told not to edit, and that is an instruction, not a sandbox.
+- Claude's `--max-turns` stops a loop. The Codex substitute is a wall-clock kill. A quiet worker that is still making progress can be killed at 1800 seconds. Raise `--timeout-seconds` if that happens.
+- Report files for setup A live in `runs/`, outside the git worktree. `--add-dir` is what makes that directory writable from the workspace-write sandbox. The runner creates the directory before launch.
+- The checker starts `npm start` and calls the API. If the sandbox refuses the listen, the checker fails closed. Do not switch the whole lab to `--dangerously-bypass-approvals-and-sandbox` to get around that.
+- Setup A roles (worker, merger, checker) are separate processes, so they are inlined role files, not `.codex/agents` entries. The four team roles are the TOML files.
+
+Use a throwaway clone. `--approve-for-me` can edit the workspace and approve commands inside that sandbox. `bypassPermissions` removes the sandbox. `runs/` logs are gitignored and can contain a prompt that echoed a secret.
 
 ## Walkthrough: setup A
 

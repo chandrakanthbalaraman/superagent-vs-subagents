@@ -89,3 +89,51 @@ export function buildTeamSessionPrompt(tickets: Ticket[], reportPath: string): s
     "summary: <one line>",
   ].join("\n");
 }
+
+export function buildCodexPlainSessionPrompt(tickets: Ticket[], reportPath: string): string {
+  return [
+    "You are one Codex session started with `codex exec`. This is the subagent lab, plain setup.",
+    "Finish every ready ticket below. They share this working tree.",
+    "You may spawn a subagent for a narrow lookup. Codex does not spawn one unless you ask.",
+    "The harness counts spawn_agent items in the JSONL stream.",
+    "Do not take on the super-agent router, worker, merger, checker, or watchdog roles.",
+    "Skip README.md and every root-level dotfile.",
+    "",
+    "Ready tickets:",
+    buildRoster(tickets.filter((ticket) => ticket.status === "ready")),
+    "",
+    "For each ticket, read specs/tickets/<id>/spec.md and eval.md before editing.",
+    "When you finish, write:",
+    reportPath,
+    "Use one block per ticket with these lines:",
+    "ticket: <id>",
+    "status: done",
+    "eval_first_try: <true or false>",
+    "tests: <pass or fail>",
+    "summary: <one line>",
+  ].join("\n");
+}
+
+export function buildCodexTeamSessionPrompt(tickets: Ticket[], reportPath: string): string {
+  return [
+    "You are one Codex session started with `codex exec`. This is the subagent lab, team setup.",
+    "Finish every ready ticket.",
+    "Spawn the project subagents named planner, implementer, test-writer, and reviewer.",
+    "Those agents are defined in .codex/agents. Ask for each spawn by name.",
+    "Do not spawn router, worker, merger, checker, or watchdog.",
+    "You coordinate. Prefer not to edit product code in the main session.",
+    "Skip README.md and every root-level dotfile.",
+    "",
+    "Ready tickets:",
+    buildRoster(tickets.filter((ticket) => ticket.status === "ready")),
+    "",
+    "When you finish, write:",
+    reportPath,
+    "Use one block per ticket with these lines:",
+    "ticket: <id>",
+    "status: done",
+    "eval_first_try: <true or false>",
+    "tests: <pass or fail>",
+    "summary: <one line>",
+  ].join("\n");
+}

@@ -11,6 +11,8 @@ const VALUE_FLAGS = new Set([
   "--stale-seconds",
   "--runs",
   "--timings",
+  "--agent-cli",
+  "--timeout-seconds",
 ]);
 
 export function parseFlags(argv: string[], allowed: ReadonlySet<string>): Map<string, string | true> {

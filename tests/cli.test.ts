@@ -96,6 +96,58 @@ describe("runner dry-run", () => {
     expect(team.stdout).toContain("planner");
   });
 
+  it("prints Codex commands for both setups without a login", async () => {
+    const superagent = await runTsx(
+      ["scripts/run-superagent.ts", "--dry-run", "--agent-cli", "codex", "--ticket", "001-search", "--only", "workers"],
+      { PATH: "/usr/bin:/bin" },
+    );
+    expect(superagent.code).toBe(0);
+    expect(superagent.stdout).toContain("codex exec");
+    expect(superagent.stdout).toContain("--json");
+    expect(superagent.stdout).toContain("--approve-for-me");
+    expect(superagent.stdout).toContain("--add-dir");
+    expect(superagent.stdout).toContain("resume");
+    expect(superagent.stdout).toContain("<session_id>");
+    expect(superagent.stdout).toContain("no --agent flag");
+    expect(superagent.stdout).toContain("You are one worker");
+    expect(superagent.stdout).toContain("--full-auto is not passed");
+    expect(superagent.stdout).not.toContain("\n  --full-auto");
+    expect(superagent.stdout).not.toContain("\n  --max-turns");
+    expect(superagent.stdout).not.toContain("\n  --agent");
+    expect(superagent.stdout).not.toContain("\n  --sandbox");
+    expect(superagent.stdout).not.toContain("\nclaude ");
+    expect(existsSync(path.join(root, ".worktrees"))).toBe(false);
+
+    const plain = await runTsx(["scripts/run-subagents.ts", "--dry-run", "--agent-cli", "codex", "--mode", "plain"], {
+      PATH: "/usr/bin:/bin",
+    });
+    expect(plain.code).toBe(0);
+    expect(plain.stdout).toContain("codex exec");
+    expect(plain.stdout).toContain("--json");
+    expect(plain.stdout).toContain("spawn a subagent");
+    expect(plain.stdout).not.toContain("\n  --append-system-prompt-file");
+
+    const team = await runTsx(["scripts/run-subagents.ts", "--dry-run", "--agent-cli", "codex", "--mode", "team"], {
+      PATH: "/usr/bin:/bin",
+    });
+    expect(team.code).toBe(0);
+    expect(team.stdout).toContain("planner");
+    expect(team.stdout).toContain("implementer");
+    expect(team.stdout).toContain("test-writer");
+    expect(team.stdout).toContain("reviewer");
+    expect(team.stdout).toContain(".codex/agents");
+    expect(team.stdout).toContain("orchestrator");
+    expect(team.stdout).not.toContain("\n  --append-system-prompt-file");
+    expect(team.stdout).not.toContain("\n  --agent");
+  });
+
+  it("refuses a real Codex run when codex is not on PATH", async () => {
+    const result = await runTsx(["scripts/run-superagent.ts", "--agent-cli", "codex"], { PATH: "/usr/bin:/bin" });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/codex/i);
+    expect(existsSync(path.join(root, ".worktrees"))).toBe(false);
+  });
+
   it("prints help, an empty metrics report, and a reset dry-run", async () => {
     const help = await runTsx(["scripts/run-superagent.ts", "--help"]);
     expect(help.code).toBe(0);
